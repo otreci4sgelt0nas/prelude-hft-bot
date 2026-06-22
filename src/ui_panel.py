@@ -20,9 +20,16 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
                session_pnl=0.0, trade_count=0, regime="", phase="",
                data_source="http", status_msg="", price_to_beat=0.0, ws_status="",
                trade_history=None, last_action="", asset_name="BTC",
-               poly_latency_ms=0):
+               poly_latency_ms=0, trading_mode="LIVE",
+               unrealized_pnl=0.0, virtual_balance=0.0):
     """Redraws the static panel at the top (HEADER_LINES lines).
-    Uses StringIO buffer for single write+flush (reduces terminal I/O)."""
+    Uses StringIO buffer for single write+flush (reduces terminal I/O).
+
+    Extra paper-mode params:
+        trading_mode:     'LIVE' or 'PAPER'
+        unrealized_pnl:   current unrealised P&L for open paper positions
+        virtual_balance:  current virtual wallet balance
+    """
     w = shutil.get_terminal_size().columns
     buf = io.StringIO()
 
@@ -32,7 +39,13 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
     buf.write(f"\033[1;1H\033[K {C}{B}{'═' * (w - 2)}{X}")
 
     # Line 2: header with time and balance
-    buf.write(f"\033[2;1H\033[K {C}{B}RADAR POLYMARKET{X} │ {W}{time_str}{X} │ Balance: {G}${balance:.2f}{X} │ Trade: {W}${trade_amount:.0f}{X}")
+    if trading_mode == "PAPER":
+        mode_badge = f" {Y}{B}[PAPER TRADING]{X}"
+        bal_label  = f"VirtualBal: {Y}${virtual_balance:.2f}{X}"
+    else:
+        mode_badge = ""
+        bal_label  = f"Balance: {G}${balance:.2f}{X}"
+    buf.write(f"\033[2;1H\033[K {C}{B}RADAR POLYMARKET{X}{mode_badge} │ {W}{time_str}{X} │ {bal_label} │ Trade: {W}${trade_amount:.0f}{X}")
 
     # Line 3: separator
     buf.write(f"\033[3;1H\033[K {C}{'═' * (w - 2)}{X}")
@@ -82,7 +95,7 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
     # Line 6: Polymarket
     buf.write(f"\033[6;1H\033[K {G}POLY    {X}│ {asset_name}: {W}${btc_price:>8,.2f}{X} │ UP: {G}${up_buy:.2f}{X}/{G}${1.0 - down_buy:.2f}{X} ({G}{up_buy * 100:.0f}%{X}) │ DOWN: {R}${down_buy:.2f}{X}/{R}${1.0 - up_buy:.2f}{X} ({R}{down_buy * 100:.0f}%{X})")
 
-    # Line 7: Positions + Session P&L
+    # Line 7: Positions + Session P&L (with PAPER mode labels)
     pnl_color = G if session_pnl >= 0 else R
     th = trade_history or []
     stats_str = ""
@@ -95,7 +108,17 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
         gl = abs(sum(t for t in th if t < 0))
         pf = (gw / gl) if gl > 0 else gw
         stats_str = f" │ {wr_color}WR:{wr:.0f}%{X}({G}{wins}W{X}/{R}{losses}L{X}) │ {W}PF:{pf:.1f}{X}"
-    pnl_str = f"{pnl_color}{B}P&L: {'+' if session_pnl >= 0 else ''}${session_pnl:.2f}{X} {D}({trade_count} trades){X}{stats_str}"
+    if trading_mode == "PAPER":
+        pnl_label = f"{Y}VIRTUAL P&L{X}"
+        unreal_color = G if unrealized_pnl >= 0 else R
+        unreal_sign  = "+" if unrealized_pnl >= 0 else ""
+        unreal_str   = f" │ {D}Unreal:{X}{unreal_color}{unreal_sign}${unrealized_pnl:.2f}{X}"
+        pos_label = f"{Y}VIRTUAL POS{X}"
+    else:
+        pnl_label  = f"{M}POSITION{X}"
+        unreal_str = ""
+        pos_label  = f"{M}POSITION{X}"
+    pnl_str = f"{pnl_color}{B}{'+' if session_pnl >= 0 else ''}${session_pnl:.2f}{X} {D}({trade_count} trades){X}{stats_str}{unreal_str}"
     if positions:
         agg = {}
         for p in positions:
@@ -110,9 +133,9 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
             avg_price = agg[d]['cost'] / total_sh if total_sh > 0 else 0
             p_color = G if d == 'up' else R
             parts.append(f"{p_color}{d.upper()} {total_sh:.0f}sh @ ${avg_price:.2f}{X}")
-        buf.write(f"\033[7;1H\033[K {M}POSITION{X}│ {' │ '.join(parts)} │ {pnl_str}")
+        buf.write(f"\033[7;1H\033[K {pos_label}│ {' │ '.join(parts)} │ {pnl_label}: {pnl_str}")
     else:
-        buf.write(f"\033[7;1H\033[K {M}POSITION{X}│ {D}None{X} │ {pnl_str}")
+        buf.write(f"\033[7;1H\033[K {pos_label}│ {D}None{X} │ {pnl_label}: {pnl_str}")
 
     # Line 8: Last action
     if last_action:
@@ -173,7 +196,11 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
     buf.write(f"\033[11;1H\033[K {'─' * (w - 2)}")
 
     # Line 12: Hotkeys
-    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=close all{X} │ {W}{B}S{X}{D}=accept signal{X} │ {W}{B}Q{X}{D}=exit{X}")
+    if trading_mode == "PAPER":
+        paper_note = f" │ {Y}{B}PAPER MODE — no real orders{X}"
+    else:
+        paper_note = ""
+    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=close all{X} │ {W}{B}S{X}{D}=accept signal{X} │ {W}{B}Q{X}{D}=exit{X}{paper_note}")
 
     # Line 13: bottom separator
     buf.write(f"\033[13;1H\033[K {C}{B}{'═' * (w - 2)}{X}")
