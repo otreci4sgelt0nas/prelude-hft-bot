@@ -76,6 +76,7 @@ from trade_executor import (
     handle_buy, execute_close_market, close_all_positions, monitor_tp_sl,
     sync_positions,
 )
+from paper_engine import PaperEngine
 from input_handler import wait_for_key, sleep_with_key
 from session_stats import print_session_summary
 
@@ -88,6 +89,10 @@ TRADE_AMOUNT = float(os.getenv('TRADE_AMOUNT', '4'))
 PRICE_BEAT_ALERT = float(os.getenv('PRICE_BEAT_ALERT', '80'))
 HISTORY_MAXLEN = 60
 MARKET_REFRESH_INTERVAL = 60  # seconds between market slug checks
+
+TRADING_MODE = os.getenv('TRADING_MODE', 'LIVE').upper()
+PAPER_BALANCE = float(os.getenv('PAPER_BALANCE', '1000.0'))
+IS_PAPER = TRADING_MODE == 'PAPER'
 
 # Persistent HTTP session (reuses TCP connections via keep-alive)
 _session = requests.Session()
@@ -172,6 +177,10 @@ class TradingSession:
         # Data history
         self.history = deque(maxlen=HISTORY_MAXLEN)
 
+        # Paper trading engine (None in LIVE mode)
+        self.paper_engine: PaperEngine | None = None
+        self.unrealized_pnl: float = 0.0
+
         # Error tracking for exponential backoff
         self.binance_errors = 0
         self.market_refresh_errors = 0
@@ -226,18 +235,25 @@ def main():
     # -- Session state --
     session = TradingSession()
 
-    # -- Clear screen and donation banner --
+    # -- Clear screen and startup banner --
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
     DONATION_WALLET = "0xa27Bf6B2B26594f8A1BF6Ab50B00Ae0e503d71F6"
     print()
     print(f"  {C}{B}{'═' * 62}{X}")
-    print(f"  {C}{B}  POLYMARKET CRYPTO SCALPING RADAR{X}")
+    if IS_PAPER:
+        print(f"  {Y}{B}  POLYMARKET CRYPTO SCALPING RADAR  [PAPER TRADING]{X}")
+    else:
+        print(f"  {C}{B}  POLYMARKET CRYPTO SCALPING RADAR{X}")
     print(f"  {C}{'─' * 62}{X}")
     print(f"  {W}  Real-time scalping tool for Polymarket updown markets.{X}")
     print(f"  {W}  Monitors Binance price + 6 indicators (RSI, MACD, VWAP,{X}")
     print(f"  {W}  Bollinger, S/R, ADX) to generate UP/DOWN signals with{X}")
     print(f"  {W}  regime detection and phase-aware thresholds.{X}")
+    if IS_PAPER:
+        print(f"  {Y}{B}  ⚠  PAPER TRADING MODE — no real orders will be placed{X}")
+        print(f"  {Y}  Virtual trades logged to paper_trades.db{X}")
+        print(f"  {Y}  Virtual balance: ${PAPER_BALANCE:.2f} │ Set TRADING_MODE=LIVE for real trading{X}")
     print(f"  {D}  Asset: {G}{config.display_name}{D} │ Window: {G}{config.window_min}m{D} │ Trade: {G}${trade_amount:.0f}{X}")
     print(f"  {C}{'═' * 62}{X}")
     print()
@@ -259,16 +275,25 @@ def main():
     print()
 
     # -- Connection (before clearing screen) --
-    print(f"\n{C}{B}RADAR POLYMARKET - {config.display_name} {config.window_min}m - Connecting...{X}")
+    if IS_PAPER:
+        print(f"\n{Y}{B}RADAR POLYMARKET - {config.display_name} {config.window_min}m - PAPER TRADING MODE{X}")
+    else:
+        print(f"\n{C}{B}RADAR POLYMARKET - {config.display_name} {config.window_min}m - Connecting...{X}")
 
-    print(f"   Connecting to Polymarket...", end="", flush=True)
-    try:
-        client, limit = create_client()
-        session.balance = get_balance(client)
-        print(f" {G}✓{X} Balance: ${session.balance:.2f}")
-    except Exception as e:
-        print(f" {R}✗{X} {e}")
-        return
+    client = None
+    if IS_PAPER:
+        session.paper_engine = PaperEngine(starting_balance=PAPER_BALANCE)
+        session.balance = session.paper_engine.virtual_balance
+        print(f"   {Y}[PAPER]{X} Virtual balance: {G}${session.balance:.2f}{X} (from paper_trades.db)")
+    else:
+        print(f"   Connecting to Polymarket...", end="", flush=True)
+        try:
+            client, limit = create_client()
+            session.balance = get_balance(client)
+            print(f" {G}✓{X} Balance: ${session.balance:.2f}")
+        except Exception as e:
+            print(f" {R}✗{X} {e}")
+            return
 
     print(f"   Finding {config.display_name} {config.window_min}m market...", end="", flush=True)
     try:
@@ -288,17 +313,20 @@ def main():
     except (ValueError, IndexError, requests.RequestException) as e:
         logger.debug("Price to beat fetch error: %s", e)
 
-    # Sync existing positions (bought directly on Polymarket platform)
-    print(f"   Checking existing positions...", end="", flush=True)
-    changes = sync_positions(client, session.token_up, session.token_down,
-                             session.positions, get_price)
-    if changes:
-        print(f" {G}✓{X} Found {len(changes)} position(s):")
-        for direction, shares, price, action in changes:
-            d_color = G if direction == 'up' else R
-            print(f"      {d_color}● {direction.upper()}{X} {shares:.0f}sh @ ${price:.2f} (from platform)")
+    # Sync existing positions (live only; paper starts with no positions)
+    if IS_PAPER:
+        print(f"   {Y}[PAPER]{X} No position sync (simulated trading)")
     else:
-        print(f" {D}─{X} No existing positions")
+        print(f"   Checking existing positions...", end="", flush=True)
+        changes = sync_positions(client, session.token_up, session.token_down,
+                                 session.positions, get_price)
+        if changes:
+            print(f" {G}✓{X} Found {len(changes)} position(s):")
+            for direction, shares, price, action in changes:
+                d_color = G if direction == 'up' else R
+                print(f"      {d_color}● {direction.upper()}{X} {shares:.0f}sh @ ${price:.2f} (from platform)")
+        else:
+            print(f" {D}─{X} No existing positions")
 
     # Start Binance WebSocket
     binance_ws = BinanceWS(symbol=config.ws_symbol)
@@ -349,7 +377,9 @@ def main():
                    session.market_slug, time_remaining, 0, 0, session.positions, None, trade_amount,
                    session_pnl=session.session_pnl, trade_count=session.trade_count,
                    price_to_beat=session.price_to_beat, trade_history=session.trade_history,
-                   last_action=session.last_action, asset_name=config.display_name)
+                   last_action=session.last_action, asset_name=config.display_name,
+                   trading_mode=TRADING_MODE,
+                   virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
 
         print(f"   {D}Collecting initial data...{X}")
 
@@ -374,10 +404,16 @@ def main():
                         if new_slug != session.market_slug:
                             if session.positions:
                                 print(f"   {Y}{B}MARKET CHANGED → {new_slug} — clearing {len(session.positions)} old position(s){X}")
-                                total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
-                                    session.positions, session.token_up, session.token_down,
-                                    radar_logger, "market_expired",
-                                    session.session_pnl, session.trade_history, get_price)
+                                if IS_PAPER and session.paper_engine:
+                                    total_pnl, cnt, session.session_pnl, pnl_list = session.paper_engine.close_all(
+                                        session.positions, session.token_up, session.token_down,
+                                        session.market_slug, get_price, radar_logger, "market_expired",
+                                        session.session_pnl, session.trade_history)
+                                else:
+                                    total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
+                                        session.positions, session.token_up, session.token_down,
+                                        radar_logger, "market_expired",
+                                        session.session_pnl, session.trade_history, get_price)
                                 session.trade_count += cnt
                                 for d, sh, ep, xp, pnl in pnl_list:
                                     pnl_color = G if pnl >= 0 else R
@@ -397,26 +433,30 @@ def main():
                         session.base_time = time_remaining
                         session.last_market_check = now
 
-                        # Sync positions with platform (detect buys/sells made outside the radar)
-                        try:
-                            changes = sync_positions(
-                                client, session.token_up, session.token_down,
-                                session.positions, get_price)
-                            if changes:
-                                for direction, shares, price, action in changes:
-                                    d_color = G if direction == 'up' else R
-                                    if action == 'added':
-                                        print(f"   {C}{B}SYNC{X} {d_color}● {direction.upper()}{X} +{shares:.0f}sh @ ${price:.2f} {D}(detected on platform){X}")
-                                    else:
-                                        print(f"   {C}{B}SYNC{X} {d_color}● {direction.upper()}{X} -{shares:.0f}sh {D}(sold on platform){X}")
-                        except Exception as e:
-                            logger.debug("Position sync error: %s", e)
+                        # Sync positions with platform (live only)
+                        if not IS_PAPER:
+                            try:
+                                changes = sync_positions(
+                                    client, session.token_up, session.token_down,
+                                    session.positions, get_price)
+                                if changes:
+                                    for direction, shares, price, action in changes:
+                                        d_color = G if direction == 'up' else R
+                                        if action == 'added':
+                                            print(f"   {C}{B}SYNC{X} {d_color}● {direction.upper()}{X} +{shares:.0f}sh @ ${price:.2f} {D}(detected on platform){X}")
+                                        else:
+                                            print(f"   {C}{B}SYNC{X} {d_color}● {direction.upper()}{X} -{shares:.0f}sh {D}(sold on platform){X}")
+                            except Exception as e:
+                                logger.debug("Position sync error: %s", e)
 
-                        # Re-sync balance with platform
-                        try:
-                            session.balance = get_balance(client)
-                        except Exception as e:
-                            logger.debug("Balance sync error: %s", e)
+                            # Re-sync balance with platform
+                            try:
+                                session.balance = get_balance(client)
+                            except Exception as e:
+                                logger.debug("Balance sync error: %s", e)
+                        else:
+                            # Paper mode: keep balance in sync with virtual engine
+                            session.balance = session.paper_engine.virtual_balance
 
                     except (requests.RequestException, KeyError, ValueError) as e:
                         session.market_refresh_errors += 1
@@ -464,7 +504,9 @@ def main():
                                session_pnl=session.session_pnl, trade_count=session.trade_count,
                                status_msg=f"{Y}Binance error — retrying in {delay:.0f}s...{X}",
                                price_to_beat=session.price_to_beat, trade_history=session.trade_history,
-                               last_action=session.last_action, asset_name=config.display_name)
+                               last_action=session.last_action, asset_name=config.display_name,
+                               trading_mode=TRADING_MODE,
+                               virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
                     key = sleep_with_key(delay)
                     if key == 'q':
                         raise KeyboardInterrupt
@@ -488,7 +530,9 @@ def main():
                                ws_status=binance_ws.status,
                                price_to_beat=session.price_to_beat, trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               trading_mode=TRADING_MODE,
+                               virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
                     key = sleep_with_key(2)
                     if key == 'q':
                         raise KeyboardInterrupt
@@ -520,6 +564,12 @@ def main():
 
                 now_str = datetime.now().strftime("%H:%M:%S")
 
+                # Update unrealised P&L for paper mode
+                if IS_PAPER and session.paper_engine and session.positions:
+                    session.unrealized_pnl = session.paper_engine.calculate_unrealized_pnl(
+                        session.positions, session.token_up, session.token_down, get_price)
+                    session.balance = session.paper_engine.virtual_balance
+
                 # -- UPDATE STATIC PANEL --
                 draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
                            binance_data, session.market_slug, current_time, up_buy,
@@ -531,7 +581,10 @@ def main():
                            ws_status=binance_ws.status,
                            price_to_beat=session.price_to_beat, trade_history=session.trade_history,
                            last_action=session.last_action, asset_name=config.display_name,
-                           poly_latency_ms=session.poly_latency_ms)
+                           poly_latency_ms=session.poly_latency_ms,
+                           trading_mode=TRADING_MODE,
+                           unrealized_pnl=session.unrealized_pnl,
+                           virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
 
                 # -- SCROLLING LOG --
                 s_dir = session.current_signal['direction']
@@ -618,10 +671,31 @@ def main():
 
                     if key == 's':
                         trade_dir = 'up' if s_dir == 'UP' else 'down'
-                        info, session.balance, session.last_action = handle_buy(
-                            client, trade_dir, trade_amount, session.token_up, session.token_down,
-                            session.positions, session.balance, radar_logger,
-                            session.session_pnl, get_price, _executor, reason="signal")
+                        if IS_PAPER and session.paper_engine:
+                            info, buy_msg = session.paper_engine.execute_buy(
+                                trade_dir, trade_amount,
+                                session.token_up, session.token_down,
+                                session.market_slug, get_price)
+                            if info:
+                                d_color = G if trade_dir == 'up' else R
+                                session.last_action = (f"{d_color}{B}BUY {trade_dir.upper()}{X} "
+                                                       f"{info['shares']:.0f}sh @ ${info['price']:.2f} │ "
+                                                       f"{Y}PAPER signal{X}")
+                                session.positions.append(info)
+                                session.balance = session.paper_engine.virtual_balance
+                                radar_logger.log_trade("BUY", trade_dir, info['shares'], info['price'],
+                                                       info['shares'] * info['price'], "paper:signal",
+                                                       0, session.session_pnl)
+                                print(f"   {Y}{buy_msg}{X}")
+                            else:
+                                session.last_action = f"{R}✗ [PAPER] BUY {trade_dir.upper()} FAILED{X}"
+                                print(f"   {R}{buy_msg}{X}")
+                            info = info  # retain for TP/SL block below
+                        else:
+                            info, session.balance, session.last_action = handle_buy(
+                                client, trade_dir, trade_amount, session.token_up, session.token_down,
+                                session.positions, session.balance, radar_logger,
+                                session.session_pnl, get_price, _executor, reason="signal")
                         if info:
                             real_entry = info['price']
                             tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
@@ -644,11 +718,24 @@ def main():
                             else:
                                 exit_color = R
                             print(f"   {exit_color}{B}⚡ {reason} @ ${exit_price:.2f}! Closing...{X}")
-                            close_msg = execute_close_market(
-                                client, session.token_up, session.token_down,
-                                get_price, _executor)
-                            print(f"   {close_msg}")
-                            pnl = (exit_price - real_entry) * info['shares']
+
+                            if IS_PAPER and session.paper_engine:
+                                _, pnl, close_msg = session.paper_engine.close_position(
+                                    trade_dir, info['shares'], real_entry,
+                                    session.token_up, session.token_down,
+                                    session.market_slug, get_price, reason.lower())
+                                print(f"   {Y}{close_msg}{X}")
+                                session.balance = session.paper_engine.virtual_balance
+                                session.positions.clear()
+                            else:
+                                close_msg = execute_close_market(
+                                    client, session.token_up, session.token_down,
+                                    get_price, _executor)
+                                print(f"   {close_msg}")
+                                pnl = (exit_price - real_entry) * info['shares']
+                                session.balance += exit_price * info['shares']
+                                session.positions.clear()
+
                             session.session_pnl += pnl
                             session.trade_count += 1
                             session.trade_history.append(pnl)
@@ -658,8 +745,6 @@ def main():
                             pnl_color = G if pnl >= 0 else R
                             session.last_action = f"{exit_color}{B}{reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
                             print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
-                            session.balance += exit_price * info['shares']
-                            session.positions.clear()
                             print(f"   {D}Returning to radar...{X}")
                             print()
                         else:
@@ -668,10 +753,29 @@ def main():
                         session.last_beep = time.time()
                     elif key in ('u', 'd'):
                         manual_dir = 'up' if key == 'u' else 'down'
-                        info, session.balance, session.last_action = handle_buy(
-                            client, manual_dir, trade_amount, session.token_up, session.token_down,
-                            session.positions, session.balance, radar_logger,
-                            session.session_pnl, get_price, _executor, reason="manual")
+                        if IS_PAPER and session.paper_engine:
+                            info, buy_msg = session.paper_engine.execute_buy(
+                                manual_dir, trade_amount,
+                                session.token_up, session.token_down,
+                                session.market_slug, get_price)
+                            if info:
+                                d_color = G if manual_dir == 'up' else R
+                                session.last_action = (f"{d_color}{B}BUY {manual_dir.upper()}{X} "
+                                                       f"{info['shares']:.0f}sh @ ${info['price']:.2f} │ "
+                                                       f"{Y}PAPER manual{X}")
+                                session.positions.append(info)
+                                session.balance = session.paper_engine.virtual_balance
+                                radar_logger.log_trade("BUY", manual_dir, info['shares'], info['price'],
+                                                       info['shares'] * info['price'], "paper:manual",
+                                                       0, session.session_pnl)
+                                print(f"   {Y}{buy_msg}{X}")
+                            else:
+                                session.last_action = f"{R}✗ [PAPER] BUY {manual_dir.upper()} FAILED{X}"
+                        else:
+                            _, session.balance, session.last_action = handle_buy(
+                                client, manual_dir, trade_amount, session.token_up, session.token_down,
+                                session.positions, session.balance, radar_logger,
+                                session.session_pnl, get_price, _executor, reason="manual")
                         draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
                                    binance_data, session.market_slug, current_time, up_buy,
                                    down_buy, session.positions, session.current_signal, trade_amount,
@@ -682,7 +786,10 @@ def main():
                                    price_to_beat=session.price_to_beat,
                                    trade_history=session.trade_history,
                                    last_action=session.last_action, asset_name=config.display_name,
-                                   poly_latency_ms=session.poly_latency_ms)
+                                   poly_latency_ms=session.poly_latency_ms,
+                                   trading_mode=TRADING_MODE,
+                                   unrealized_pnl=session.unrealized_pnl,
+                                   virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
                     else:
                         print(f"   {D}Ignored.{X}")
                         print()
@@ -696,10 +803,28 @@ def main():
                 key = sleep_with_key(cycle_time)
                 if key in ('u', 'd'):
                     buy_dir = 'up' if key == 'u' else 'down'
-                    _, session.balance, session.last_action = handle_buy(
-                        client, buy_dir, trade_amount, session.token_up, session.token_down,
-                        session.positions, session.balance, radar_logger,
-                        session.session_pnl, get_price, _executor, reason="manual")
+                    if IS_PAPER and session.paper_engine:
+                        info, buy_msg = session.paper_engine.execute_buy(
+                            buy_dir, trade_amount,
+                            session.token_up, session.token_down,
+                            session.market_slug, get_price)
+                        if info:
+                            d_color = G if buy_dir == 'up' else R
+                            session.last_action = (f"{d_color}{B}BUY {buy_dir.upper()}{X} "
+                                                   f"{info['shares']:.0f}sh @ ${info['price']:.2f} │ "
+                                                   f"{Y}PAPER manual{X}")
+                            session.positions.append(info)
+                            session.balance = session.paper_engine.virtual_balance
+                            radar_logger.log_trade("BUY", buy_dir, info['shares'], info['price'],
+                                                   info['shares'] * info['price'], "paper:manual",
+                                                   0, session.session_pnl)
+                        else:
+                            session.last_action = f"{R}✗ [PAPER] BUY {buy_dir.upper()} FAILED{X}"
+                    else:
+                        _, session.balance, session.last_action = handle_buy(
+                            client, buy_dir, trade_amount, session.token_up, session.token_down,
+                            session.positions, session.balance, radar_logger,
+                            session.session_pnl, get_price, _executor, reason="manual")
                     draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
                                binance_data, session.market_slug, current_time, up_buy,
                                down_buy, session.positions, session.current_signal, trade_amount,
@@ -710,11 +835,15 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               trading_mode=TRADING_MODE,
+                               unrealized_pnl=session.unrealized_pnl,
+                               virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
                 elif key == 'c':
                     # Show closing status in static panel
-                    session.set_status(f"{Y}{B}EMERGENCY CLOSE...{X}", duration=5)
-                    session.last_action = f"{R}{B}EMERGENCY CLOSE{X}"
+                    close_label = "[PAPER] EMERGENCY CLOSE" if IS_PAPER else "EMERGENCY CLOSE"
+                    session.set_status(f"{Y}{B}{close_label}...{X}", duration=5)
+                    session.last_action = f"{R}{B}{close_label}{X}"
                     draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
                                binance_data, session.market_slug, current_time, up_buy,
                                down_buy, session.positions, session.current_signal, trade_amount,
@@ -726,17 +855,29 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
-                    msg = execute_close_market(client, session.token_up, session.token_down,
-                                              get_price, _executor)
-                    if session.positions:
-                        total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
-                            session.positions, session.token_up, session.token_down,
-                            radar_logger, "emergency",
-                            session.session_pnl, session.trade_history, get_price)
-                        session.trade_count += cnt
-                        for d, sh, ep, xp, pnl in pnl_list:
-                            session.balance += xp * sh
+                               poly_latency_ms=session.poly_latency_ms,
+                               trading_mode=TRADING_MODE,
+                               unrealized_pnl=session.unrealized_pnl,
+                               virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
+                    if IS_PAPER and session.paper_engine:
+                        if session.positions:
+                            total_pnl, cnt, session.session_pnl, pnl_list = session.paper_engine.close_all(
+                                session.positions, session.token_up, session.token_down,
+                                session.market_slug, get_price, radar_logger, "emergency",
+                                session.session_pnl, session.trade_history)
+                            session.trade_count += cnt
+                            session.balance = session.paper_engine.virtual_balance
+                    else:
+                        msg = execute_close_market(client, session.token_up, session.token_down,
+                                                  get_price, _executor)
+                        if session.positions:
+                            total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
+                                session.positions, session.token_up, session.token_down,
+                                radar_logger, "emergency",
+                                session.session_pnl, session.trade_history, get_price)
+                            session.trade_count += cnt
+                            for d, sh, ep, xp, pnl in pnl_list:
+                                session.balance += xp * sh
                     # Show result in static panel
                     pnl_color = G if session.session_pnl >= 0 else R
                     session.set_status(
@@ -754,7 +895,10 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               trading_mode=TRADING_MODE,
+                               unrealized_pnl=session.unrealized_pnl,
+                               virtual_balance=session.paper_engine.virtual_balance if IS_PAPER else 0.0)
                 elif key == 'q':
                     raise KeyboardInterrupt
 
